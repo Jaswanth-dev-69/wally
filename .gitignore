@@ -1,0 +1,41 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE / Editor
+.idea/
+.vscode/
+
+# Testing / type checking
+.pytest_cache/
+.mypy_cache/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Downloaded wallpapers (generated content)
+wallpaper/*.jpg
+wallpaper/*.jpeg
+wallpaper/*.png
+wallpaper/*.webp
+
+# Cache directories
+.cache/
