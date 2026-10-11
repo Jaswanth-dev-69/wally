@@ -1,0 +1,18 @@
+[Unit]
+Description=Wally - Pinterest wallpaper updater
+# Started by wally.timer after login, never as part of session startup, so it
+# cannot delay or block the desktop. Network and desktop are waited for inside
+# the script with hard time limits.
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+# gsettings needs the session bus; the user manager normally exports this
+# already, setting it here makes it explicit.
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+ExecStart=/usr/bin/python3 @PROJECT_DIR@/wallpaper.py --once-per-login --desktop-timeout 120 --network-timeout 30
+# Worst case: 120s desktop + 30s network + 3 x ~65s gallery-dl + slack.
+TimeoutStartSec=420
+Nice=15
+IOSchedulingClass=idle
