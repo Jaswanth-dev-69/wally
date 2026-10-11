@@ -7,12 +7,21 @@ not used last run), pulls a handful of 16:9 / >=1920px images from it via
 gallery-dl, picks one that hasn't been shown recently, and sets it as the
 GNOME desktop background.
 
-Searching only one category per run (instead of all of them every time) is
-what keeps this fast -- normally a single gallery-dl call. Spreading across
-many categories plus remembering recently-shown images is what keeps the
-results from cycling through the same handful of pictures.
+Safety rules (this script is started in the background right after login, so
+it must never leave the desktop without a valid background):
 
-Project layout (exactly as required):
+  * Only one instance runs at a time (flock on a lock file).
+  * Waits for the desktop and for the network, each with a hard maximum, and
+    gives up quietly (exit 0) so the systemd timer can retry later.
+  * Downloads into a persistent scratch dir (~/.cache/wally, not /tmp),
+    wrapped in `timeout` so gallery-dl can never hang.
+  * The new image is validated with Pillow, written to a temp file inside
+    the wallpaper folder and moved over wallpaper.jpg with os.replace()
+    (atomic). On any failure the existing wallpaper.jpg is left untouched.
+  * gsettings is only ever called with the path of a file that exists, is
+    non-empty and decodes as an image. It is never given "" or a directory.
+
+Project layout:
 
     wally/
     |-- wallpaper.py
@@ -22,8 +31,11 @@ Project layout (exactly as required):
         `-- .last_query     <- last search category used (one line of text)
 """
 
+import argparse
+import fcntl
 import hashlib
 import io
+import os
 import random
 import shutil
 import socket
@@ -40,10 +52,21 @@ from PIL import Image
 # Configuration -- tweak freely
 # ---------------------------------------------------------------------------
 PROJECT_DIR = Path(__file__).resolve().parent
-WALLPAPER_DIR = PROJECT_DIR / "wallpaper"
+# WALLY_WALLPAPER_DIR / WALLY_CACHE_DIR exist so the tests can run against
+# throwaway directories; normal use never sets them.
+WALLPAPER_DIR = Path(os.environ.get("WALLY_WALLPAPER_DIR")
+                     or PROJECT_DIR / "wallpaper")
 WALLPAPER_PATH = WALLPAPER_DIR / "wallpaper.jpg"
 SEEN_HASHES_PATH = WALLPAPER_DIR / ".seen_hashes"
 LAST_QUERY_PATH = WALLPAPER_DIR / ".last_query"
+
+# Persistent scratch space (NOT /tmp): downloads and the lock file live here.
+CACHE_DIR = Path(os.environ.get("WALLY_CACHE_DIR")
+                 or Path(os.environ.get("XDG_CACHE_HOME")
+                         or Path.home() / ".cache") / "wally")
+LOCK_PATH = CACHE_DIR / "wally.lock"
+
+TIMER_UNIT = "wally.timer"   # stopped after a successful --once-per-login run
 
 SEARCH_QUERIES = [
     "viltrumite pc wallpaper",
@@ -78,25 +101,25 @@ DOWNLOAD_RANGE = "1-3"      # matching pins to fetch from the ONE category
                              # picked this run. Only ONE of these ever gets
                              # used -- kept small on purpose because several
                              # categories ("8k wallpapers", "4k pc wallpaper")
-                             # can be multi-MB files; downloading more than a
-                             # couple of them per run was the main reason
-                             # this was slow.
+                             # can be multi-MB files.
 HTTP_TIMEOUT = "10"          # fail fast instead of hanging on a slow request
 RETRIES = "1"                # fewer retries on network hiccups = faster exit
+GALLERY_DL_TIMEOUT = 60      # hard wall-clock cap (seconds) per gallery-dl
+                             # call, enforced with `timeout`
 MAX_ATTEMPTS = 3             # how many different categories to try in a
-                             # single run before giving up (only kicks in if
-                             # a category comes back empty or fully repeated)
+                             # single run before giving up
 SEEN_HASHES_MAX = 60         # remember this many recent wallpapers across
                              # ALL categories combined, oldest dropped first
 
-# Run right at login (see autostart setup below), the network is sometimes
-# not up yet for the first few seconds. Rather than a blind fixed sleep,
-# the script polls a couple of fast, reliable hosts and proceeds the moment
-# they're reachable -- so it's effectively instant once boot is actually
-# done, and only waits as long as truly necessary otherwise.
-NETWORK_CHECK_HOSTS = [("1.1.1.1", 443), ("8.8.8.8", 443)]
-NETWORK_WAIT_TIMEOUT = 30    # give up waiting after this many seconds
+# Started shortly after login, the desktop and network may not be up yet.
+# Both waits have a hard maximum; if exceeded the script exits 0 and the
+# systemd timer simply tries again a few minutes later.
+DESKTOP_WAIT_TIMEOUT = 120   # seconds to wait for gnome-shell
+NETWORK_WAIT_TIMEOUT = 30    # seconds to wait for connectivity
 NETWORK_CHECK_INTERVAL = 2   # seconds between connectivity checks
+# host:port probes; a successful TCP connect to ANY of them means "online".
+# The first one also proves DNS works, which gallery-dl needs.
+NETWORK_CHECK_HOSTS = [("www.pinterest.com", 443), ("1.1.1.1", 443)]
 
 VALID_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
 
@@ -105,8 +128,24 @@ def log(msg: str) -> None:
     print(f"[wallpaper] {msg}", flush=True)
 
 
+def _network_hosts() -> list[tuple[str, int]]:
+    # WALLY_NETWORK_HOSTS="host:port,host:port" overrides the probes (tests).
+    raw = os.environ.get("WALLY_NETWORK_HOSTS")
+    if not raw:
+        return NETWORK_CHECK_HOSTS
+    hosts = []
+    for item in raw.split(","):
+        host, _, port = item.strip().rpartition(":")
+        if host and port.isdigit():
+            hosts.append((host, int(port)))
+    return hosts
+
+
+# ---------------------------------------------------------------------------
+# Waiting for the session
+# ---------------------------------------------------------------------------
 def network_available() -> bool:
-    for host, port in NETWORK_CHECK_HOSTS:
+    for host, port in _network_hosts():
         try:
             with socket.create_connection((host, port), timeout=3):
                 return True
@@ -115,21 +154,63 @@ def network_available() -> bool:
     return False
 
 
-def wait_for_network() -> None:
-    deadline = time.time() + NETWORK_WAIT_TIMEOUT
+def wait_for_network(timeout: float) -> bool:
+    """True once online; False if still offline after `timeout` seconds."""
+    deadline = time.monotonic() + timeout
     announced = False
-    while time.time() < deadline:
+    while True:
         if network_available():
             if announced:
                 log("Network is up.")
-            return
+            return True
+        if time.monotonic() >= deadline:
+            return False
         if not announced:
-            log("Network not ready yet (normal right after boot) -- "
+            log("Network not ready yet (normal right after login) -- "
                 "waiting...")
             announced = True
-        time.sleep(NETWORK_CHECK_INTERVAL)
-    log("WARNING: network still unreachable after "
-        f"{NETWORK_WAIT_TIMEOUT}s -- attempting anyway.")
+        time.sleep(min(NETWORK_CHECK_INTERVAL,
+                       max(0.0, deadline - time.monotonic())))
+
+
+def desktop_running() -> bool:
+    return subprocess.run(
+        ["pgrep", "-u", str(os.getuid()), "-x", "gnome-shell"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def wait_for_desktop(timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while not desktop_running():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(2)
+    return True
+
+
+def ensure_session_bus_env() -> None:
+    # Started from a systemd user unit or autostart, gsettings can end up
+    # without a bus address and then silently writes nothing.
+    if os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        return
+    bus = Path(f"/run/user/{os.getuid()}/bus")
+    if bus.exists():
+        os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus}"
+
+
+# ---------------------------------------------------------------------------
+# Single-instance lock
+# ---------------------------------------------------------------------------
+def acquire_lock():
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    fh = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +225,10 @@ def read_lines(path: Path) -> list[str]:
 
 
 def write_lines(path: Path, lines: list[str]) -> None:
-    path.write_text("\n".join(lines) + "\n" if lines else "")
+    # Atomic too, so a crash can't leave a half-written state file.
+    tmp = path.with_name(path.name + ".new")
+    tmp.write_text("\n".join(lines) + "\n" if lines else "")
+    os.replace(tmp, path)
 
 
 def choose_query(last_query: str | None, exclude: set[str]) -> str:
@@ -158,10 +242,9 @@ def choose_query(last_query: str | None, exclude: set[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Step 1 -- download candidates for ONE query into a throwaway temp folder
-# (auto-deletes itself, even if the script crashes).
+# Step 1 -- download candidates for ONE query into a scratch folder.
 # ---------------------------------------------------------------------------
-def download_candidates(tmp_dir: Path, query: str) -> None:
+def download_candidates(tmp_dir: Path, query: str) -> bool:
     url = f"https://www.pinterest.com/search/pins/?q={quote(query)}"
 
     # Server-side filter: gallery-dl checks each pin's own width/height
@@ -183,18 +266,33 @@ def download_candidates(tmp_dir: Path, query: str) -> None:
         "-d", str(tmp_dir),
         url,
     ]
+    # `timeout` guarantees gallery-dl can't hang: SIGTERM after the limit,
+    # SIGKILL 5s later if it ignores that.
+    if shutil.which("timeout"):
+        cmd = ["timeout", "--kill-after=5", str(GALLERY_DL_TIMEOUT)] + cmd
+        py_timeout = None
+    else:
+        py_timeout = GALLERY_DL_TIMEOUT + 5
+
     log(f"Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=py_timeout)
+    except subprocess.TimeoutExpired:
+        log(f"gallery-dl timed out after {GALLERY_DL_TIMEOUT}s.")
+        return False
+    if result.returncode == 124:
+        log(f"gallery-dl timed out after {GALLERY_DL_TIMEOUT}s.")
+    elif result.returncode != 0:
         log("gallery-dl exited non-zero (continuing -- some files may "
             "still have downloaded successfully).")
         if result.stderr:
             log(result.stderr.strip()[-800:])
+    return result.returncode == 0
 
 
 # ---------------------------------------------------------------------------
 # Step 2 -- local safety-net filter: width >= MIN_WIDTH AND ratio == 16:9.
-# Confirms what gallery-dl's --filter should have already guaranteed.
 # ---------------------------------------------------------------------------
 def find_valid_wallpapers(tmp_dir: Path) -> list[Path]:
     valid = []
@@ -217,9 +315,7 @@ def find_valid_wallpapers(tmp_dir: Path) -> list[Path]:
 
 
 def encode_jpeg(path: Path) -> bytes:
-    # Only ever called once per run, on the single winning image -- NOT on
-    # every candidate. Decoding + re-encoding a genuine 8K image is real
-    # CPU work, so this used to run up to DOWNLOAD_RANGE times for nothing.
+    # Only ever called on the single winning image -- NOT on every candidate.
     with Image.open(path) as img:
         rgb = img.convert("RGB")
         buf = io.BytesIO()
@@ -232,74 +328,112 @@ def hash_bytes(data: bytes) -> str:
 
 
 def hash_file(path: Path) -> str:
-    # Identity check for "have I shown this before" -- hashes the raw
-    # downloaded bytes directly, no image decode required. Cheap even for
-    # huge files, and that's all we need it for.
     return hash_bytes(path.read_bytes())
 
 
+def is_valid_image_file(path: Path) -> bool:
+    """Regular, non-empty file that Pillow can fully decode."""
+    try:
+        if not path.is_file() or path.stat().st_size == 0:
+            return False
+        with Image.open(path) as img:
+            img.load()
+        return True
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
-# Step 3 -- write the winner OVER the existing wallpaper.jpg IN PLACE.
+# Step 3 -- replace wallpaper.jpg ATOMICALLY.
 #
-# This is the fix for the original "gsettings shows the right path but the
-# desktop never refreshes" bug. Deleting wallpaper.jpg and creating a new
-# file with the same name breaks the inotify watch GNOME uses on that
-# inode. Writing the new bytes into the SAME open file (O_TRUNC, no
-# unlink) keeps the inode -- and the watch -- intact.
+# The new image is fully written (and fsync'd) to a temp file in the same
+# folder, validated, then moved over wallpaper.jpg with rename(2). At every
+# instant wallpaper.jpg is either the complete old image or the complete new
+# one -- never missing, empty or half-written, which is what GNOME Shell
+# could previously catch mid-write at login.
 # ---------------------------------------------------------------------------
-def write_wallpaper(jpeg_bytes: bytes) -> None:
+def write_wallpaper(jpeg_bytes: bytes) -> bool:
     WALLPAPER_DIR.mkdir(parents=True, exist_ok=True)
-    with open(WALLPAPER_PATH, "wb") as f:
-        f.write(jpeg_bytes)
+    fd, tmp_name = tempfile.mkstemp(prefix=".wallpaper-", suffix=".jpg.new",
+                                    dir=WALLPAPER_DIR)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(jpeg_bytes)
+            f.flush()
+            os.fsync(f.fileno())
+        if not is_valid_image_file(tmp):
+            log("New wallpaper failed validation -- keeping the existing one.")
+            return False
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, WALLPAPER_PATH)
+    finally:
+        tmp.unlink(missing_ok=True)
     log(f"Saved winning wallpaper -> {WALLPAPER_PATH}")
+    return True
 
 
 # ---------------------------------------------------------------------------
-# Step 4 -- force GNOME to actually repaint the background.
+# Step 4 -- tell GNOME to use it (never with an empty/missing path).
 # ---------------------------------------------------------------------------
-def apply_wallpaper() -> None:
-    uri = f"file://{WALLPAPER_PATH}"
+def _gsettings(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["gsettings", *args], capture_output=True,
+                          text=True, timeout=20)
 
-    def gset(key: str, value: str) -> None:
-        subprocess.run(
-            ["gsettings", "set", "org.gnome.desktop.background", key, value],
-            check=False,
-        )
 
-    for key in ("picture-uri", "picture-uri-dark"):
-        gset(key, "")
-    gset("picture-options", "zoom")
-    for key in ("picture-uri", "picture-uri-dark"):
-        gset(key, uri)
+def apply_wallpaper() -> bool:
+    if not is_valid_image_file(WALLPAPER_PATH):
+        log(f"Refusing to call gsettings: {WALLPAPER_PATH} is missing, "
+            "empty or not a valid image.")
+        return False
 
-    log("Applied wallpaper via gsettings (picture-uri + picture-uri-dark).")
+    uri = WALLPAPER_PATH.resolve().as_uri()
+    # GNOME only reloads when the key's *string* changes. The old code forced
+    # that by briefly setting "" (an empty background -- and the source of
+    # "Failed to load background 'file:///home/<user>'"). Instead, if the
+    # value is already the same, flip through an equivalent spelling of the
+    # same existing file ("/./") first. Every value ever set points at a real
+    # file.
+    alt_uri = uri.replace("/wallpaper.jpg", "/./wallpaper.jpg")
+    try:
+        for key in ("picture-uri", "picture-uri-dark"):
+            current = _gsettings("get", "org.gnome.desktop.background", key)
+            if current.returncode == 0 and uri in current.stdout:
+                _gsettings("set", "org.gnome.desktop.background", key,
+                           alt_uri)
+        _gsettings("set", "org.gnome.desktop.background",
+                   "picture-options", "zoom")
+        ok = True
+        for key in ("picture-uri", "picture-uri-dark"):
+            r = _gsettings("set", "org.gnome.desktop.background", key, uri)
+            ok = ok and r.returncode == 0
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"gsettings failed: {exc}")
+        return False
+    if ok:
+        log("Applied wallpaper via gsettings (picture-uri + "
+            "picture-uri-dark).")
+    else:
+        log("WARNING: gsettings reported an error; wallpaper.jpg was "
+            "updated but the setting may not have changed.")
+    return ok
+
+
+def stop_retry_timer() -> None:
+    subprocess.run(["systemctl", "--user", "stop", TIMER_UNIT],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   check=False)
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main() -> int:
-    if shutil.which("gallery-dl") is None:
-        log("ERROR: gallery-dl is not installed or not on PATH.")
-        log("Install it with: pip install --user gallery-dl")
-        return 1
-    if shutil.which("gsettings") is None:
-        log("ERROR: gsettings not found -- is this really a GNOME session?")
-        return 1
-
-    wait_for_network()
-
-    WALLPAPER_DIR.mkdir(parents=True, exist_ok=True)
-
-    seen_hashes = read_lines(SEEN_HASHES_PATH)
-    seen_set = set(seen_hashes)
+def pick_wallpaper(scratch: Path):
+    """Download + validate. Returns (jpeg_bytes, hash, query) or None."""
+    seen_set = set(read_lines(SEEN_HASHES_PATH))
     last_query = (read_lines(LAST_QUERY_PATH) or [None])[0]
-
     tried_queries: set[str] = set()
-    winner_bytes = None
-    winner_hash = None
-    used_query = None
-    fallback = None  # (bytes, hash, query) -- best we found even if "seen"
+    fallback = None  # best we found even if "seen"
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         query = choose_query(last_query, tried_queries)
@@ -307,57 +441,117 @@ def main() -> int:
         log(f"Attempt {attempt}/{MAX_ATTEMPTS}: searching Pinterest for "
             f"'{query}'...")
 
-        with tempfile.TemporaryDirectory(prefix="pinterest_wp_") as tmp:
-            tmp_dir = Path(tmp)
-            download_candidates(tmp_dir, query)
-            candidates = find_valid_wallpapers(tmp_dir)
-            log(f"Found {len(candidates)} valid 16:9 wallpaper(s) "
-                f"(width >= {MIN_WIDTH}px) for '{query}'.")
+        attempt_dir = scratch / f"attempt{attempt}"
+        attempt_dir.mkdir()
+        download_candidates(attempt_dir, query)
+        candidates = find_valid_wallpapers(attempt_dir)
+        log(f"Found {len(candidates)} valid 16:9 wallpaper(s) "
+            f"(width >= {MIN_WIDTH}px) for '{query}'.")
+        if not candidates:
+            continue
 
-            if not candidates:
-                continue
+        scored = [(path, hash_file(path)) for path in candidates]
+        fresh = [(p, h) for p, h in scored if h not in seen_set]
+        if fresh:
+            chosen_path, _ = random.choice(fresh)
+            data = encode_jpeg(chosen_path)
+            return data, hash_bytes(data), query
 
-            # Cheap identity check on the raw downloaded bytes -- no image
-            # decoding needed here, so this stays fast even for huge files.
-            scored = [(path, hash_file(path)) for path in candidates]
-            fresh = [(p, h) for p, h in scored if h not in seen_set]
+        if fallback is None:
+            chosen_path, _ = random.choice(scored)
+            data = encode_jpeg(chosen_path)
+            fallback = (data, hash_bytes(data), query)
 
-            if fresh:
-                chosen_path, _ = random.choice(fresh)
-                # The ONLY decode + JPEG re-encode this run does, and only
-                # for the single image that actually wins.
-                winner_bytes = encode_jpeg(chosen_path)
-                winner_hash = hash_bytes(winner_bytes)
-                used_query = query
-                break
-
-            if fallback is None:
-                chosen_path, _ = random.choice(scored)
-                fb_bytes = encode_jpeg(chosen_path)
-                fallback = (fb_bytes, hash_bytes(fb_bytes), query)
-
-        # tmp_dir and every losing candidate are now gone -- nothing leftover.
-
-    if not winner_bytes and fallback:
+    if fallback:
         log("WARNING: every candidate across the categories tried matches "
-            "something shown recently -- reusing one anyway so the desktop "
-            "still changes from whatever it currently is.")
-        winner_bytes, winner_hash, used_query = fallback
+            "something shown recently -- reusing one anyway.")
+    return fallback
 
-    if not winner_bytes:
-        log(f"ERROR: No valid 16:9 wallpapers found after {MAX_ATTEMPTS} "
-            "attempts. Nothing was changed.")
+
+def run(dry_run: bool, once_per_login: bool,
+        network_timeout: float, desktop_timeout: float) -> int:
+    if shutil.which("gallery-dl") is None:
+        log("ERROR: gallery-dl is not installed or not on PATH.")
+        log("Install it with: pip install --user gallery-dl")
+        return 1
+    if shutil.which("gsettings") is None and not dry_run:
+        log("ERROR: gsettings not found -- is this really a GNOME session?")
         return 1
 
-    write_wallpaper(winner_bytes)
+    lock = acquire_lock()
+    if lock is None:
+        log("Another instance is already running -- exiting.")
+        return 0
 
-    seen_hashes.append(winner_hash)
-    write_lines(SEEN_HASHES_PATH, seen_hashes[-SEEN_HASHES_MAX:])
-    write_lines(LAST_QUERY_PATH, [used_query])
+    with lock:
+        if not dry_run and desktop_timeout > 0 \
+                and not wait_for_desktop(desktop_timeout):
+            log("Desktop (gnome-shell) not up yet -- giving up for now; "
+                "will retry later.")
+            return 0
+        ensure_session_bus_env()
 
-    apply_wallpaper()
-    log(f"Done. (category: '{used_query}')")
-    return 0
+        if not wait_for_network(network_timeout):
+            log(f"No network after {network_timeout:.0f}s -- giving up for "
+                "now; will retry later. Wallpaper left untouched.")
+            return 0
+
+        # Leftovers from a crashed run are safe to delete: we hold the lock.
+        scratch_root = CACHE_DIR / "tmp"
+        shutil.rmtree(scratch_root, ignore_errors=True)
+        scratch_root.mkdir(parents=True)
+        try:
+            picked = pick_wallpaper(scratch_root)
+            if picked is None:
+                log(f"No valid 16:9 wallpapers found after {MAX_ATTEMPTS} "
+                    "attempts. Wallpaper left untouched; will retry later.")
+                return 0
+
+            jpeg_bytes, jpeg_hash, used_query = picked
+            if dry_run:
+                log(f"DRY RUN: would set a {len(jpeg_bytes)}-byte wallpaper "
+                    f"from '{used_query}'. Nothing was changed.")
+                return 0
+
+            if not write_wallpaper(jpeg_bytes):
+                return 0
+
+            seen = read_lines(SEEN_HASHES_PATH)
+            seen.append(jpeg_hash)
+            write_lines(SEEN_HASHES_PATH, seen[-SEEN_HASHES_MAX:])
+            write_lines(LAST_QUERY_PATH, [used_query])
+
+            apply_wallpaper()
+            log(f"Done. (category: '{used_query}')")
+            if once_per_login:
+                stop_retry_timer()
+            return 0
+        finally:
+            shutil.rmtree(scratch_root, ignore_errors=True)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--dry-run", action="store_true",
+                        help="wait for network, download and validate, but "
+                             "do not touch wallpaper.jpg, state files or "
+                             "gsettings")
+    parser.add_argument("--once-per-login", action="store_true",
+                        help="after a successful update, stop wally.timer so "
+                             "no further retries happen until next login "
+                             "(used by the systemd service)")
+    parser.add_argument("--network-timeout", type=float,
+                        default=NETWORK_WAIT_TIMEOUT, metavar="SEC",
+                        help="max seconds to wait for network "
+                             f"(default {NETWORK_WAIT_TIMEOUT})")
+    parser.add_argument("--desktop-timeout", type=float,
+                        default=0, metavar="SEC",
+                        help="max seconds to wait for gnome-shell to be "
+                             "running (default 0 = don't wait; the systemd "
+                             f"service passes {DESKTOP_WAIT_TIMEOUT})")
+    args = parser.parse_args(argv)
+    return run(args.dry_run, args.once_per_login,
+               args.network_timeout, args.desktop_timeout)
 
 
 if __name__ == "__main__":

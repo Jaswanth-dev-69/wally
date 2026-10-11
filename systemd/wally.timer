@@ -1,0 +1,13 @@
+[Unit]
+Description=Wally - update the wallpaper shortly after login, retrying until it works
+
+[Timer]
+# 60s after the user manager starts (= at login).
+OnStartupSec=60
+# If that run found no network, try again 5 minutes after it finished. After
+# the first successful update the script stops this timer until next login.
+OnUnitInactiveSec=5min
+Unit=wally.service
+
+[Install]
+WantedBy=timers.target
